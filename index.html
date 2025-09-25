@@ -1,0 +1,145 @@
+<!doctype html>
+<html lang="es">
+  <head>
+    <meta charset="utf-8">
+    <meta http-equiv="X-UA-Compatible" content="IE=edge">
+    <meta name="viewport" content="initial-scale=1,user-scalable=no,maximum-scale=1,width=device-width">
+    <title>MAPA DE PRECIOS + Comentarios (Pendientes)</title>
+    <link rel="stylesheet" href="css/leaflet.css">
+    <link rel="stylesheet" href="css/qgis2web.css">
+    <link rel="stylesheet" href="css/fontawesome-all.min.css">
+    <style>
+      html, body, #map { width: 100%; height: 100%; margin: 0; }
+      .comments-wrap { font-family: system-ui, sans-serif; }
+      .comment-form { display: grid; gap: 6px; margin-top: 8px; }
+      .comment-form input, .comment-form textarea { width: 100%; padding: 8px; border-radius: 8px; border: 1px solid #ccc; }
+      .comment-form button { padding: 8px 10px; border: 0; border-radius: 8px; background: #2563eb; color: white; font-weight: 600; cursor: pointer; }
+      .comment-form button[disabled] { opacity: 0.6; cursor: not-allowed; }
+    </style>
+  </head>
+  <body>
+    <div id="map"></div>
+
+    <!-- LIBRERÍAS -->
+    <script src="js/leaflet.js"></script>
+    <script src="js/leaflet-hash.js"></script>
+    <script src="js/Autolinker.min.js"></script>
+
+    <!-- TU GEOJSON -->
+    <script src="data/MANZANAS_1.js"></script>
+
+    <!-- Supabase JS v2 -->
+    <script src="https://cdn.jsdelivr.net/npm/@supabase/supabase-js@2"></script>
+
+    <script>
+      // ⚙️ 1. CONFIGURA AQUÍ TUS CREDENCIALES DE SUPABASE
+      // 👉 Copia desde Supabase > Configuración > API
+      const SUPABASE_URL = "https://gmqqxcgrlcvvbttanxss.supabase.co"; // <-- CAMBIA ESTO
+      const SUPABASE_ANON_KEY = "eyJhbGciOiJIUzI1NiIsInR5cCI6IkpXVCJ9.eyJpc3MiOiJzdXBhYmFzZSIsInJlZiI6ImdtcXF4Y2dybGN2dmJ0dGFueHNzIiwicm9sZSI6ImFub24iLCJpYXQiOjE3NTg4MjAzODgsImV4cCI6MjA3NDM5NjM4OH0.0A_o7t8I4A97OWdcJCS6A1kdc08Vrhx4Iuo4BEHijek";               // <-- CAMBIA ESTO
+
+      // Inicializar cliente Supabase
+      const supabase = window.supabase.createClient(SUPABASE_URL, SUPABASE_ANON_KEY);
+
+      function fmtDate(iso) {
+        try { return new Date(iso).toLocaleString(); } catch { return iso; }
+      }
+
+      // Inicializar mapa
+      var map = L.map('map').fitBounds([[-2.899377,-79.0005],[-2.839014,-78.873049]]);
+      L.tileLayer('https://mt1.google.com/vt/lyrs=s&x={x}&y={y}&z={z}', { maxZoom: 22 }).addTo(map);
+
+      function polygonIdFromFeature(f) {
+        return (f && f.properties && (f.properties['NUMERO'] ?? f.properties['id'])) ?? String(Math.random()).slice(2);
+      }
+
+      // ⚙️ 2. SOLO MOSTRAR COMENTARIOS APROBADOS
+      async function loadComments(polygonId, listEl) {
+        const { data, error } = await supabase
+          .from('comments')
+          .select('*')
+          .eq('polygon_id', String(polygonId))
+          .eq('status', 'aprobado') // <-- SOLO PUBLICADOS
+          .order('created_at', { ascending: true });
+
+        if (error) { listEl.innerHTML = 'Error cargando comentarios'; return; }
+        listEl.innerHTML = '';
+        if (!data || data.length === 0) { listEl.textContent = 'Sin comentarios aprobados'; return; }
+
+        data.forEach(row => {
+          const item = document.createElement('div');
+          item.textContent = (row.author || 'Anónimo') + ': ' + row.body;
+          if (row.attachment) {
+            const a = document.createElement('a');
+            a.href = row.attachment; a.target = "_blank"; a.textContent = " [Archivo]";
+            item.appendChild(a);
+          }
+          listEl.appendChild(item);
+        });
+      }
+
+      // ⚙️ 3. AL ENVIAR, QUEDA EN ESTADO PENDIENTE
+      async function handleSubmit(ev, polygonId, listEl, btnEl) {
+        ev.preventDefault();
+        const form = ev.target;
+        const author = form.querySelector('input[name="author"]').value.trim() || 'Anónimo';
+        const body = form.querySelector('textarea[name="body"]').value.trim();
+        const fileInput = form.querySelector('input[name="attachment"]');
+        let fileUrl = null;
+
+        // Subir archivo al bucket "uploads"
+        if (fileInput.files.length > 0) {
+          const file = fileInput.files[0];
+          const { data: upload, error: upErr } = await supabase.storage
+            .from('uploads')          // <-- BUCKET: asegúrate que se llame "uploads"
+            .upload(Date.now() + '_' + file.name, file);
+          if (!upErr) {
+            const { data: pub } = supabase.storage.from('uploads').getPublicUrl(upload.path);
+            fileUrl = pub.publicUrl;
+          }
+        }
+
+        btnEl.disabled = true;
+        try {
+          await supabase.from('comments').insert({
+            polygon_id: String(polygonId),
+            author,
+            body,
+            status: 'pendiente', // <-- NO PUBLICADO AUTOMÁTICAMENTE
+            attachment: fileUrl
+          });
+          form.reset();
+          alert('Enviado para revisión. Se publicará cuando sea aprobado.');
+        } catch (e) { console.error(e); }
+        btnEl.disabled = false;
+      }
+
+      // Popups con formulario
+      function pop_MANZANAS_1(feature, layer) {
+        const polygonId = polygonIdFromFeature(feature);
+        const html = `
+          <div class="comments-wrap">
+            <div id="list-${polygonId}">Cargando...</div>
+            <form id="form-${polygonId}" class="comment-form">
+              <input type="text" name="author" maxlength="80" placeholder="Tu nombre (opcional)"/>
+              <textarea name="body" rows="3" maxlength="1000" placeholder="Escribe tu comentario..." required></textarea>
+              <input type="file" name="attachment" />
+              <button type="submit" id="btn-${polygonId}">Enviar para revisión</button>
+            </form>
+          </div>`;
+        layer.bindPopup(html);
+        layer.on('popupopen', async (e) => {
+          const popupEl = e.popup.getElement();
+          const listEl = popupEl.querySelector('#list-' + polygonId);
+          const formEl = popupEl.querySelector('#form-' + polygonId);
+          const btnEl  = popupEl.querySelector('#btn-' + polygonId);
+          await loadComments(polygonId, listEl);
+          formEl.addEventListener('submit', (ev) => handleSubmit(ev, polygonId, listEl, btnEl));
+        });
+      }
+
+      // Cargar capas GEOJSON
+      var layer_MANZANAS_1 = new L.geoJson(json_MANZANAS_1, { onEachFeature: pop_MANZANAS_1 });
+      map.addLayer(layer_MANZANAS_1);
+    </script>
+  </body>
+</html>
